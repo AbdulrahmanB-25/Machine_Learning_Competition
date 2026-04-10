@@ -1,29 +1,18 @@
-"""
-Riyadh Livability Index — Streamlit Dashboard
-==============================================
-Mirrors RLI_Engine.ipynb logic exactly.
-
-• 4 pillar weight sliders (auto-normalized)
-• Match % per neighborhood (% of top scorer's RLI)
-• Top-5 PCA scatter with star markers
-• Pillar DNA radar chart
-• Full 176-neighborhood ranking table
-• Imputation audit panel
-"""
-
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import os, sys
 
+# Ensure the engine is in the path if it's a separate file, 
+# though we assume the engine logic is imported or available.
 sys.path.insert(0, os.path.dirname(__file__))
 from rli_engine import run_full_pipeline, recommend, PILLARS, ALL_RLI_FEATURES
 
-# ── Page Config ───────────────────────────────────────────────────────────────
+# ── 1. Page Config & Styling ──────────────────────────────────────────────────
 st.set_page_config(
     page_title='Riyadh Livability Index',
-    page_icon='🏙️',
+    page_icon='City',
     layout='wide',
     initial_sidebar_state='expanded',
 )
@@ -38,214 +27,103 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ── Palette (matches notebook) ────────────────────────────────────────────────
-GOLD, CYAN, CORAL, MINT, PURPLE = '#f0c05a', '#4fc3f7', '#ff6b6b', '#66bb6a', '#ab47bc'
-PALETTE = [GOLD, CYAN, CORAL, MINT, PURPLE]
-
-
-# ── Load Data ─────────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner='Running ML pipeline on 346K rows...')
+# ── 2. Data Loading ───────────────────────────────────────────────────────────
+@st.cache_data
 def load_pipeline():
-    for path in [
-        '/mnt/user-data/uploads/Riyadh_Master_Dataset.csv',
-        os.path.join(os.path.dirname(__file__), 'Riyadh_Master_Dataset.csv'),
-    ]:
-        if os.path.exists(path):
-            return run_full_pipeline(path)
-    st.error('Riyadh_Master_Dataset.csv not found.')
-    st.stop()
+    # Update this to your actual file name
+    csv_path = 'Riyadh_Master_Dataset.csv'
+    if not os.path.exists(csv_path):
+        st.error(f"Dataset {csv_path} not found!")
+        st.stop()
+    return run_full_pipeline(csv_path)
 
 pipe = load_pipeline()
+df_raw = pipe['df_raw']
 
+# ── 3. Sidebar: Pillar Weighting ──────────────────────────────────────────────
+st.sidebar.title("⚖️ Pillar Weights")
+st.sidebar.info("Adjust the importance of each urban pillar.")
 
-# ── Sidebar: Pillar Weight Sliders ────────────────────────────────────────────
-st.sidebar.title('🎛️ Pillar Weights')
-st.sidebar.caption('Drag sliders to set importance per pillar. Weights are auto-normalized to sum to 1.')
+w_core = st.sidebar.slider('Core Essentials', 0.0, 1.0, 0.40)
+w_mob  = st.sidebar.slider('Mobility', 0.0, 1.0, 0.25)
+w_well = st.sidebar.slider('Well-being', 0.0, 1.0, 0.20)
+w_inf  = st.sidebar.slider('Infrastructure', 0.0, 1.0, 0.15)
 
-w_core = st.sidebar.slider('🏥 Core (Medical · Schools · Retail · Mosques)',
-                            0.0, 1.0, 0.40, 0.05)
-w_mob  = st.sidebar.slider('🚌 Mobility (Bus · Metro · Walkability · Connectivity)',
-                            0.0, 1.0, 0.25, 0.05)
-w_wb   = st.sidebar.slider('🌳 Well-being (Dining · Parks · Sports · Fitness)',
-                            0.0, 1.0, 0.20, 0.05)
-w_inf  = st.sidebar.slider('🏗️ Infrastructure (Fiber · Govt · Malls · Universities)',
-                            0.0, 1.0, 0.15, 0.05)
+# Normalize weights so they sum to 1.0
+total_w = w_core + w_mob + w_well + w_inf
+weights = {
+    'Core': w_core / total_w,
+    'Mobility': w_mob / total_w,
+    'Well-being': w_well / total_w,
+    'Infrastructure': w_inf / total_w
+}
 
-user_weights = {'Core': w_core, 'Mobility': w_mob, 'Well-being': w_wb, 'Infrastructure': w_inf}
-total_w = sum(user_weights.values()) or 1.0
-user_weights = {k: v / total_w for k, v in user_weights.items()}
+# ── 4. Main Header ────────────────────────────────────────────────────────────
+st.title("🏙️ Riyadh Livability Index (RLI)")
+st.markdown("### Neighborhood DNA — The 15-Minute City Analysis")
 
-st.sidebar.markdown('---')
-st.sidebar.markdown('**Normalized Weights:**')
-for k, v in user_weights.items():
-    st.sidebar.markdown(f'- **{k}**: {v:.0%}')
+# ── 5. NEW SECTION: Property Preferences ──────────────────────────────────────
+with st.expander("🎯 Filter by Property Preferences", expanded=True):
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        category_map = {1: "Apartment (Rent)", 3: "Villa", 6: "Apartment (Sale)", 2: "Land"}
+        selected_cat = st.selectbox("Property Type", options=list(category_map.keys()), 
+                                    format_func=lambda x: category_map[x])
+    
+    with col2:
+        max_price = st.slider("Maximum Price (SAR)", 10000, 5000000, 1500000, step=50000)
+        
+    with col3:
+        if selected_cat in [1, 3, 6]:
+            min_rooms = st.number_input("Minimum Rooms", 0, 10, 3)
+        else:
+            min_rooms = 0
+            st.write("Rooms N/A for this type")
 
-
-# ── Compute Recommendations ──────────────────────────────────────────────────
-df_rec = recommend(pipe['df_imputed'], user_weights=user_weights, top_n=176)
-
-# Attach PCA + cluster from base pipeline
-base = pipe['df_scored'][['PC1', 'PC2', 'km_cluster']]
-df_rec = df_rec.join(base, rsuffix='_drop')
-df_rec.drop(columns=[c for c in df_rec.columns if c.endswith('_drop')],
-            inplace=True, errors='ignore')
-
-
-# ── Header ────────────────────────────────────────────────────────────────────
-st.title('🏙️ Riyadh Livability Index (RLI)')
-st.markdown(
-    'Neighborhood scoring via **Cluster-Centroid Imputation** → '
-    '**4-Pillar Weighted Sum** × **Shannon Entropy Diversity Multiplier** → '
-    '**0–100 min-max normalization** (best neighborhood = 100).'
+# ── 6. Compute Recommendations ────────────────────────────────────────────────
+# Using the engine's recommend function with our new filters
+df_rec = recommend(
+    df_raw, 
+    user_weights=weights, 
+    category=selected_cat, 
+    max_price=max_price, 
+    min_rooms=min_rooms,
+    top_n=10
 )
 
+if df_rec.empty:
+    st.warning("⚠️ No properties match your criteria. Try broadening your filters.")
+    st.stop()
 
-# ── Top 5 Metrics ────────────────────────────────────────────────────────────
-st.subheader('🏆 Top 5 Matches')
-top5 = df_rec.head(5)
-
-cols = st.columns(5)
-for i, (idx, row) in enumerate(top5.iterrows()):
-    with cols[i]:
-        name = idx.replace(' Dist.', '') if isinstance(idx, str) else str(idx)
-        st.metric(
-            label=f'#{i+1}  {name}',
-            value=f'{row["match_pct"]:.0f}%',
-            delta=f'RLI {row["RLI"]:.1f}',
-        )
-
-
-# ── PCA Scatter — Top 5 Highlighted ──────────────────────────────────────────
-st.subheader('📊 PCA Scatter — Top 5 Highlighted')
-
-df_plot = df_rec.copy()
-df_plot['label'] = df_plot.index.map(lambda n: n.replace(' Dist.', '') if isinstance(n, str) else str(n))
-df_plot['is_top5'] = False
-df_plot.iloc[:5, df_plot.columns.get_loc('is_top5')] = True
-
+# ── 7. Visualization: Radar Chart ─────────────────────────────────────────────
+st.subheader("📊 Neighborhood DNA Comparison (Top 3)")
 fig = go.Figure()
 
-# All neighborhoods
-other = df_plot[~df_plot['is_top5']]
-fig.add_trace(go.Scatter(
-    x=other['PC1'], y=other['PC2'],
-    mode='markers',
-    marker=dict(size=6, color=other['RLI'], colorscale='Viridis',
-                opacity=0.5, line=dict(width=0.3, color='#2a2f4e'),
-                colorbar=dict(title='RLI', thickness=15)),
-    text=other['label'],
-    hovertemplate='<b>%{text}</b><br>RLI: %{marker.color:.1f}<extra></extra>',
-    name='All Neighborhoods',
-))
-
-# Top 5
-t5 = df_plot[df_plot['is_top5']]
-fig.add_trace(go.Scatter(
-    x=t5['PC1'], y=t5['PC2'],
-    mode='markers+text',
-    marker=dict(size=16, color=GOLD, symbol='star',
-                line=dict(width=1.5, color=CORAL)),
-    text=t5['label'],
-    textposition='top center',
-    textfont=dict(size=10, color=GOLD),
-    hovertemplate='<b>%{text}</b><extra>Top 5</extra>',
-    name='Top 5 Matches',
-))
-
-fig.update_layout(
-    template='plotly_dark',
-    paper_bgcolor='#0a0e27', plot_bgcolor='#0a0e27',
-    height=500,
-    xaxis_title='PC1', yaxis_title='PC2',
-    legend=dict(orientation='h', yanchor='bottom', y=1.02),
-    margin=dict(l=40, r=40, t=60, b=40),
-)
-st.plotly_chart(fig, use_container_width=True)
-
-
-# ── Pillar DNA Radar — Top 5 ─────────────────────────────────────────────────
-st.subheader('🕸️ Pillar DNA Radar — Top 5')
-
-pillar_names = list(PILLARS.keys())
-fig_radar = go.Figure()
-
-for i, (idx, row) in enumerate(top5.iterrows()):
-    vals = [row[f'pillar_{p}'] for p in pillar_names] + [row[f'pillar_{pillar_names[0]}']]
-    name = idx.replace(' Dist.', '') if isinstance(idx, str) else str(idx)
-    fig_radar.add_trace(go.Scatterpolar(
-        r=vals,
-        theta=pillar_names + [pillar_names[0]],
+top_3 = df_rec.head(3)
+for idx, row in top_3.iterrows():
+    fig.add_trace(go.Scatterpolar(
+        r=[row['pillar_Core'], row['pillar_Mobility'], row['pillar_Well-being'], row['pillar_Infrastructure']],
+        theta=['Core', 'Mobility', 'Well-being', 'Infrastructure'],
         fill='toself',
-        name=f'#{i+1} {name}',
-        line=dict(color=PALETTE[i]),
-        opacity=0.6,
+        name=idx
     ))
 
-fig_radar.update_layout(
-    template='plotly_dark',
-    paper_bgcolor='#0a0e27',
-    polar=dict(bgcolor='#0f1333', radialaxis=dict(visible=True, color='#8b8fa3')),
-    height=420,
-    margin=dict(l=60, r=60, t=40, b=40),
-)
-st.plotly_chart(fig_radar, use_container_width=True)
+fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 1])), showlegend=True)
+st.plotly_chart(fig, use_container_width=True)
 
+# ── 8. Results Table ───────────────────────────────────────────────────────────
+st.subheader("📋 Top Neighborhood Rankings")
 
-# ── Full Ranking Table ────────────────────────────────────────────────────────
-st.subheader('📋 Full Neighborhood Ranking')
-
-display_cols = [
-    'match_pct', 'RLI', 'rank',
-    'pillar_Core', 'pillar_Mobility', 'pillar_Well-being', 'pillar_Infrastructure',
-    'H_entropy', 'km_cluster',
-]
-df_display = df_rec[[c for c in display_cols if c in df_rec.columns]].copy()
-df_display.index = df_display.index.map(lambda n: n.replace(' Dist.', '') if isinstance(n, str) else n)
-df_display.index.name = 'Neighborhood'
-df_display.columns = [c.replace('pillar_', '').replace('_', ' ').title() for c in df_display.columns]
+# Formatting for display
+df_display = df_rec[['RLI', 'match_pct', 'pillar_Core', 'pillar_Mobility', 'pillar_Well-being', 'pillar_Infrastructure']].copy()
+df_display.columns = ['RLI Score', 'Match Pct', 'Core', 'Mobility', 'Well-being', 'Infrastructure']
 
 st.dataframe(
-    df_display.style.format({
-        'Match Pct': '{:.1f}%', 'Rli': '{:.2f}',
-        'Core': '{:.4f}', 'Mobility': '{:.4f}',
-        'Well-Being': '{:.4f}', 'Infrastructure': '{:.4f}',
-        'H Entropy': '{:.4f}',
-    }).background_gradient(subset=['Match Pct'], cmap='YlOrRd'),
-    use_container_width=True, height=600,
+    df_display.style.format("{:.2f}").background_gradient(subset=['Match Pct'], cmap='YlGn'),
+    use_container_width=True
 )
 
-
-# ── Imputation Audit ─────────────────────────────────────────────────────────
-with st.expander('🔧 Data Repair Summary — Cluster-Centroid Imputation'):
-    df_orig = pipe['df_neighborhoods']
-    df_imp = pipe['df_imputed']
-
-    rows = []
-    for col in ALL_RLI_FEATURES:
-        if col in df_orig.columns:
-            n_zeros = int((df_orig[col] == 0).sum())
-            n_fixed = int(((df_orig[col] == 0) & (df_imp[col] != 0)).sum())
-            if n_zeros > 0:
-                rows.append({'Feature': col, 'Zeros Found': n_zeros, 'Repaired': n_fixed})
-
-    if rows:
-        st.dataframe(pd.DataFrame(rows).set_index('Feature'), use_container_width=True)
-    else:
-        st.info('No zero-value repairs needed.')
-
-    k = pipe['df_scored']['km_cluster'].nunique()
-    st.markdown(f'''
-    **Method:** For each of the 16 RLI features, zeros are replaced with the
-    mean of that feature within the neighborhood's K-Means cluster (k={k}).
-    This prevents neighborhoods from being penalized when their cluster peers
-    have non-zero values for the same service.
-    ''')
-
-
-# ── Footer ────────────────────────────────────────────────────────────────────
-st.markdown('---')
-st.caption(
-    'RLI Engine · Aggregate 346K rows → K-Means (k=2) → Centroid Impute 1,291 zeros → '
-    'Min-Max Scale → 4-Pillar Weighted Sum × Shannon Entropy Multiplier → '
-    '0–100 Normalization (best = 100)'
-)
+# ── 9. Footer ─────────────────────────────────────────────────────────────────
+st.markdown("---")
+st.caption("RLI Engine v2.0 | Data-driven urban planning for Riyadh")
