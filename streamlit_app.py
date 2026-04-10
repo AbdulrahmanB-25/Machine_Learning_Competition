@@ -2,12 +2,11 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import os, sys
+import os
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 
-# --- 1. CORE ENGINE LOGIC (Internalized for Stability) ---
+# --- 1. CORE ENGINE LOGIC ---
 EPSILON = 1e-9
 H_MAX = np.log(4)
 
@@ -25,7 +24,6 @@ def compute_rli(df_in, pillar_weights=None):
     pw = {k: v / total_w for k, v in pw.items()}
 
     scaler_mm = MinMaxScaler()
-    # Ensure all features exist in the dataframe
     available_features = [f for f in ALL_RLI_FEATURES if f in df_in.columns]
     scaled_vals = scaler_mm.fit_transform(df_in[available_features])
     df_sc = pd.DataFrame(scaled_vals, columns=available_features, index=df_in.index)
@@ -43,41 +41,21 @@ def compute_rli(df_in, pillar_weights=None):
     diversity_mult = 1 + (H / H_MAX)
     raw_rli = weighted_sum * diversity_mult
 
+    # Normalize to 0-100 scale
     r_min, r_max = raw_rli.min(), raw_rli.max()
     rli_100 = ((raw_rli - r_min) / (r_max - r_min + EPSILON)) * 100
 
     result = df_in.copy()
     for pname in PILLARS:
         result[f'pillar_{pname}'] = pillar_scores[pname].values
-    result['RLI'] = rli_100.round(2).values
-    result['rank'] = result['RLI'].rank(ascending=False, method='min').astype(int)
-    return result.sort_values('RLI', ascending=False)
+    result['RLI'] = rli_100.round(2)
+    # Correct Ranking Logic
+    result['Rank'] = result['RLI'].rank(ascending=False, method='min').astype(int)
+    return result.sort_values('Rank')
 
-def get_recommendations(df_raw, user_weights, category, max_price, min_rooms):
-    # Filter-First Logic
-    temp_df = df_raw.copy()
-    if category != "All":
-        temp_df = temp_df[temp_df['category'] == category]
-    temp_df = temp_df[temp_df['price'] <= max_price]
-    if 'total_rooms' in temp_df.columns and min_rooms > 0:
-        temp_df = temp_df[temp_df['total_rooms'] >= min_rooms]
+# --- 2. STREAMLIT CONFIG & DATA ---
+st.set_page_config(page_title='RLI Explorer', layout='wide')
 
-    if temp_df.empty:
-        return pd.DataFrame()
-
-    # Aggregate filtered properties to neighborhood level
-    df_agg = temp_df.groupby('neighborhood')[ALL_RLI_FEATURES].mean().fillna(0)
-    scored = compute_rli(df_agg, pillar_weights=user_weights)
-    scored['match_pct'] = (scored['RLI'] / (scored['RLI'].max() + EPSILON) * 100).round(1)
-    return scored
-
-# --- 2. STREAMLIT UI ---
-st.set_page_config(page_title='Riyadh Livability Index', layout='wide')
-
-st.title("🏙️ Riyadh Livability Index (RLI)")
-st.markdown("### Find the best neighborhood based on urban science and your budget")
-
-# Data Loading
 @st.cache_data
 def load_data():
     csv_path = 'Riyadh_Master_Dataset.csv'
@@ -88,58 +66,92 @@ def load_data():
 df_raw = load_data()
 
 if df_raw.empty:
-    st.error("Dataset not found. Please ensure 'Riyadh_Master_Dataset.csv' is in the repository.")
+    st.error("Riyadh_Master_Dataset.csv not found!")
     st.stop()
 
-# --- SIDEBAR: WEIGHTS ---
-st.sidebar.header("⚖️ Lifestyle Priorities")
-w_core = st.sidebar.slider('Core Essentials (Schools/Clinics)', 0.0, 1.0, 0.40)
-w_mob  = st.sidebar.slider('Mobility (Metro/Bus)', 0.0, 1.0, 0.25)
-w_well = st.sidebar.slider('Well-being (Parks/Dining)', 0.0, 1.0, 0.20)
-w_inf  = st.sidebar.slider('Infrastructure (Fiber/Gov)', 0.0, 1.0, 0.15)
-weights = {'Core': w_core, 'Mobility': w_mob, 'Well-being': w_well, 'Infrastructure': w_inf}
+# --- 3. SIDEBAR (Global Weights) ---
+st.sidebar.header("⚖️ RLI Weighting")
+w_core = st.sidebar.slider('Core Essentials', 0.0, 1.0, 0.40)
+w_mob  = st.sidebar.slider('Mobility', 0.0, 1.0, 0.25)
+w_well = st.sidebar.slider('Well-being', 0.0, 1.0, 0.20)
+w_inf  = st.sidebar.slider('Infrastructure', 0.0, 1.0, 0.15)
+user_weights = {'Core': w_core, 'Mobility': w_mob, 'Well-being': w_well, 'Infrastructure': w_inf}
 
-# --- MAIN PANEL: PROPERTY FILTERS ---
-with st.container(border=True):
-    st.subheader("🎯 Property Preferences")
-    col1, col2, col3 = st.columns(3)
+# --- 4. MAIN INTERFACE (TABS) ---
+st.title("🏙️ Riyadh Livability Index")
+
+tab1, tab2 = st.tabs(["🏆 City-Wide Ranking", "🎯 Personalized Search"])
+
+# --- TAB 1: CITY RANKING ---
+with tab1:
+    st.header("General Neighborhood Rankings")
+    st.write("Ranking all neighborhoods based on total service availability and your weights.")
     
-    with col1:
-        cat_options = ["All"] + sorted(list(df_raw['category'].unique()))
-        selected_cat = st.selectbox("Property Type", options=cat_options)
+    # Process all data
+    df_agg_all = df_raw.groupby('neighborhood')[ALL_RLI_FEATURES].mean().fillna(0)
+    df_city_ranked = compute_rli(df_agg_all, pillar_weights=user_weights)
     
-    with col2:
-        max_p = st.slider("Maximum Budget (SAR)", 
-                          int(df_raw['price'].min()), 
-                          int(df_raw['price'].max()), 
-                          int(df_raw['price'].mean()))
-    
-    with col3:
-        rooms = st.number_input("Minimum Rooms", 0, 10, 0)
+    # Metrics
+    top_n = df_city_ranked.iloc[0]
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Top Neighborhood", top_n.name)
+    c2.metric("Highest RLI Score", f"{top_n['RLI']}")
+    c3.metric("Neighborhoods Scored", len(df_city_ranked))
 
-# --- EXECUTION ---
-df_rec = get_recommendations(df_raw, weights, selected_cat, max_p, rooms)
-
-if df_rec.empty:
-    st.warning("No neighborhoods match these specific property criteria. Try increasing your budget or changing the category.")
-else:
-    # Top 3 Radar Chart
-    st.subheader("📊 Neighborhood DNA Comparison")
-    top_3 = df_rec.head(3)
-    fig = go.Figure()
-    for idx, row in top_3.iterrows():
-        fig.add_trace(go.Scatterpolar(
-            r=[row['pillar_Core'], row['pillar_Mobility'], row['pillar_Well-being'], row['pillar_Infrastructure']],
-            theta=['Core', 'Mobility', 'Well-being', 'Infrastructure'],
-            fill='toself', name=idx
-        ))
-    fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 1])), showlegend=True)
-    st.plotly_chart(fig, use_container_width=True)
-
-    # Results Table
-    st.subheader("📋 Recommended Neighborhoods")
-    cols_to_show = ['RLI', 'match_pct', 'pillar_Core', 'pillar_Mobility', 'pillar_Well-being', 'pillar_Infrastructure']
     st.dataframe(
-        df_rec[cols_to_show].style.format("{:.2f}").background_gradient(subset=['match_pct'], cmap='YlGn'),
+        df_city_ranked[['Rank', 'RLI', 'pillar_Core', 'pillar_Mobility', 'pillar_Well-being', 'pillar_Infrastructure']]
+        .style.format("{:.2f}", subset=['RLI', 'pillar_Core', 'pillar_Mobility', 'pillar_Well-being', 'pillar_Infrastructure'])
+        .background_gradient(subset=['RLI'], cmap='YlGn'),
         use_container_width=True
     )
+
+# --- TAB 2: PROPERTY SEARCH ---
+with tab2:
+    st.header("Find My Neighborhood")
+    st.write("Filter the city to find areas that have the specific properties you need.")
+    
+    with st.container(border=True):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            cat_list = ["All"] + sorted(list(df_raw['category'].unique()))
+            sel_cat = st.selectbox("Property Type", options=cat_list)
+        with col2:
+            max_price = st.number_input("Max Price (SAR)", value=1000000, step=50000)
+        with col3:
+            min_rms = st.number_input("Min Rooms", 0, 10, 0)
+
+    # Filtered Logic
+    df_filt = df_raw.copy()
+    if sel_cat != "All":
+        df_filt = df_filt[df_filt['category'] == sel_cat]
+    df_filt = df_filt[df_filt['price'] <= max_price]
+    if min_rms > 0 and 'total_rooms' in df_filt.columns:
+        df_filt = df_filt[df_filt['total_rooms'] >= min_rms]
+
+    if df_filt.empty:
+        st.warning("No properties match these criteria. Try increasing your budget.")
+    else:
+        df_agg_filt = df_filt.groupby('neighborhood')[ALL_RLI_FEATURES].mean().fillna(0)
+        df_search_results = compute_rli(df_agg_filt, pillar_weights=user_weights)
+        
+        # Add a Match % relative to the best neighborhood in this specific search
+        df_search_results['Match %'] = (df_search_results['RLI'] / (df_search_results['RLI'].max() + EPSILON) * 100).round(1)
+
+        # Radar Chart for Search results
+        st.subheader(f"Top 3 Results for {sel_cat}")
+        top_3_search = df_search_results.head(3)
+        fig = go.Figure()
+        for idx, row in top_3_search.iterrows():
+            fig.add_trace(go.Scatterpolar(
+                r=[row['pillar_Core'], row['pillar_Mobility'], row['pillar_Well-being'], row['pillar_Infrastructure']],
+                theta=['Core', 'Mobility', 'Well-being', 'Infrastructure'],
+                fill='toself', name=idx
+            ))
+        fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 1])), showlegend=True)
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.dataframe(
+            df_search_results[['Rank', 'RLI', 'Match %', 'pillar_Core', 'pillar_Mobility', 'pillar_Well-being', 'pillar_Infrastructure']]
+            .style.format("{:.2f}").background_gradient(subset=['Match %'], cmap='Blues'),
+            use_container_width=True
+        )
