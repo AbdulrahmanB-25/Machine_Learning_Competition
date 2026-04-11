@@ -323,7 +323,7 @@ if st.session_state.page == "home":
     st.markdown(
         """
         <div class="page-banner">
-            <h1><span class="brand-text">Smart Dwelling</span></h1>
+            <h1><span class="brand-text">Riyadh Livability Index</span></h1>
             <p>
                 Find the right neighborhood in Riyadh using livability scores,
                 property filters, and clear comparisons.
@@ -393,7 +393,7 @@ df_ranked = pipe["df_ranked"]
 # =========================================================
 # SIDEBAR
 # =========================================================
-st.sidebar.markdown("## Smart Dwelling")
+st.sidebar.markdown("## Riyadh Livability Index")
 st.sidebar.markdown("Adjust the importance of each pillar")
 
 w_core = st.sidebar.slider("Core", 0.0, 1.0, 0.40)
