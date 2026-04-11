@@ -15,7 +15,7 @@ from rli_engine import (
 # PAGE CONFIG
 # =========================================================
 st.set_page_config(
-    page_title="Smart Dwelling",
+    page_title="Riyadh Livability Index",
     page_icon="🏙️",
     layout="wide",
     initial_sidebar_state="expanded",
