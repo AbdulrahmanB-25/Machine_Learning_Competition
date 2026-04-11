@@ -1,40 +1,57 @@
 """
-Riyadh Livability Index (RLI) — Core Engine
-============================================
-Extracted from RLI_Engine.ipynb (final draft).
+Riyadh Livability Index — ML Engine
+=====================================
+Project : Neighborhood DNA — The 15-Minute City Index
+Input   : Riyadh_Master_Dataset.csv — 348K property rows × 29 columns
+Pipeline: Load → Aggregate → Density-Normalize → Log-Scale → Cluster-Impute
+          → 4-Pillar RLI Score → Rank & Recommend
 
-Pipeline: Aggregate → K-Means Cluster → Centroid-Impute Zeros
-         → 4-Pillar Weighted Score × Shannon Entropy → Rank
+Outputs two systems:
+  1. Ranking   — City-wide livability ranking of all 176 neighborhoods (no user input).
+  2. Recommend — Filter-first property search: category + price + rooms
+                 → qualifying neighborhoods ranked by RLI + price fit.
 
-RLI_i = (Σ w_j · x̂_ij) × [1 + H_i / H_max]
-    x̂  = Min-Max scaled features (0–1)
-    w  = User-defined or default pillar weights
-    H  = Shannon Entropy  −Σ p·ln(p)  across 4 pillars
-    H_max = ln(4)
+Formula:
+    RLI_i = ( Σ w_j * x̂_ij ) × [ 1 + H_i / H_max ]
+    where x̂ = MinMax-scaled log1p features,
+          w = user-defined or default pillar weights,
+          H = Shannon Entropy across 4 pillars,
+          H_max = ln(4).
 """
 
-import numpy as np
 import pandas as pd
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
-from sklearn.cluster import KMeans
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
 from sklearn.decomposition import PCA
-from sklearn.metrics import silhouette_score
+from sklearn.cluster import KMeans
 
-# ── Constants ─────────────────────────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONSTANTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
 EPSILON = 1e-9
-H_MAX = np.log(4)  # ln(4) — theoretical max Shannon entropy for 4 pillars
+H_MAX   = np.log(4)          # ln(4) — theoretical max Shannon entropy for 4 pillars
+K_BEST  = 5                  # optimal cluster count from silhouette analysis
 
-# ── Feature Groups (notebook cell 5) ──────────────────────────────────────────
-PILLAR_COLS = [
-    'dining_cafe', 'med_facilities', 'health_retail', 'fitness_care',
-    'edu_primary', 'edu_higher', 'religious', 'essential_retail',
-    'parks_green', 'sports_play', 'pedestrian', 'resort_rural_retreats',
-    'gov_civil', 'malls_shopping',
-]
-CONNECTIVITY_COLS = ['Fiber_Available', 'FWA_Available', 'Mobile_Available', 'connectivity_score']
-TRANSIT_COLS = ['bus_count', 'metro_count']
+CATEGORY_MAP = {
+    1:  'Apartment (Rent)',   2:  'Land',            3:  'Villa',
+    4:  'Floor (Rent)',       5:  'Duplex (Rent)',    6:  'Apartment (Sale)',
+    7:  'Commercial Land',    8:  'Office',           9:  'Building',
+    10: 'Compound',           11: 'Farm',             13: 'Room',
+    14: 'Shop',               15: 'Warehouse',        16: 'Commercial Building',
+    17: 'Tower',              18: 'Camp',             19: 'Parking',
+    20: 'Studio',             21: 'Chalet',           22: 'Duplex (Sale)',
+    23: 'Rest House',         24: 'Palace',
+}
 
-# ── 4 RLI Pillars (notebook cell 7) ──────────────────────────────────────────
+# Categories where room filtering makes no sense
+NO_ROOM_CATEGORIES = {
+    'Land', 'Commercial Land', 'Farm', 'Rest House', 'Parking',
+    'Warehouse', 'Camp', 'Shop',
+}
+
+# ── 4 RLI Pillars ──
 PILLARS = {
     'Core': {
         'weight': 0.40,
@@ -56,179 +73,272 @@ PILLARS = {
 
 ALL_RLI_FEATURES = sorted({f for p in PILLARS.values() for f in p['features']})
 
-# 24 ML features for clustering (notebook cell 10)
-ML_COLS = PILLAR_COLS + CONNECTIVITY_COLS + TRANSIT_COLS + [
-    'property_count', 'median_price', 'median_area', 'n_categories',
+# Features that are raw counts and need density normalization (÷ km²)
+COUNT_FEATURES = [
+    'bus_count', 'metro_count', 'dining_cafe', 'med_facilities',
+    'edu_primary', 'religious', 'essential_retail', 'parks_green',
+    'sports_play', 'malls_shopping',
 ]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Aggregation (notebook cell 5)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def aggregate_to_neighborhoods(df_raw: pd.DataFrame) -> pd.DataFrame:
-    """346K property rows → 176 neighborhood rows × 26 features."""
-    neigh_const = PILLAR_COLS + CONNECTIVITY_COLS + TRANSIT_COLS
-    df_nc = df_raw.groupby('neighborhood')[neigh_const].first()
-    df_ps = df_raw.groupby('neighborhood').agg(
-        property_count=('property_id', 'count'),
-        median_price=('price', 'median'),
-        median_area=('area', 'median'),
-        n_categories=('category', 'nunique'),
-    ).round(1)
-    df_coords = df_raw.groupby('neighborhood')[['lat', 'lng']].mean()
-    df = pd.concat([df_nc, df_ps, df_coords], axis=1)
-    df[CONNECTIVITY_COLS] = df[CONNECTIVITY_COLS].fillna(0)
-    return df
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# K-Means Clustering (notebook cell 10)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def fit_clusters(df: pd.DataFrame, k: int = 2, random_state: int = 42):
-    """StandardScale 24 features → K-Means (k=2) → PCA 2D."""
-    scaler_std = StandardScaler()
-    X_scaled = scaler_std.fit_transform(df[ML_COLS])
-
-    km = KMeans(n_clusters=k, n_init=30, random_state=random_state)
-    labels = km.fit_predict(X_scaled)
-
-    pca_2d = PCA(n_components=2, random_state=random_state)
-    X_2d = pca_2d.fit_transform(X_scaled)
-
-    return labels, km, scaler_std, pca_2d, X_2d
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Cluster-Centroid Imputation (notebook cell 14)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def cluster_centroid_impute(df: pd.DataFrame, labels: np.ndarray) -> pd.DataFrame:
-    """Replace 0-valued RLI features with their cluster mean (vectorized)."""
-    df_out = df.copy()
-    df_out['_cluster'] = labels
-
-    for col in ALL_RLI_FEATURES:
-        if col in df_out.columns:
-            df_out[col] = df_out[col].astype(float)
-
-    for col in ALL_RLI_FEATURES:
-        if col not in df_out.columns:
-            continue
-        cluster_means = df_out.groupby('_cluster')[col].transform('mean')
-        mask_zero = df_out[col] == 0
-        df_out.loc[mask_zero, col] = cluster_means[mask_zero]
-
-    df_out.drop(columns=['_cluster'], inplace=True)
-    return df_out
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# RLI Scoring (notebook cell 18 — exact logic)
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# CORE FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def compute_rli(df_in: pd.DataFrame, pillar_weights: dict | None = None):
     """
-    Compute Riyadh Livability Index for all neighborhoods.
+    Compute Riyadh Livability Index for all neighborhoods in df_in.
 
     Parameters
     ----------
-    df_in : DataFrame with ALL_RLI_FEATURES columns
-    pillar_weights : dict like {'Core': 0.4, ...} or None for defaults
+    df_in : DataFrame
+        Neighborhood-level aggregated features (index = neighborhood name).
+    pillar_weights : dict, optional
+        Custom weights like {'Core': 0.5, 'Mobility': 0.2, ...}.
+        Auto-normalized to sum to 1.0.
 
     Returns
     -------
-    df_result : DataFrame with RLI, pillar scores, entropy, rank — sorted by rank
-    scaler_mm : fitted MinMaxScaler
+    (df_result, scaler) : tuple
+        df_result sorted by rank (best first), fitted MinMaxScaler.
     """
-    pw = pillar_weights or {p: v['weight'] for p, v in PILLARS.items()}
+    pw = pillar_weights if pillar_weights else {p: v['weight'] for p, v in PILLARS.items()}
+    # Normalize weights to sum to 1
     total_w = sum(pw.values())
-    pw = {k: v / total_w for k, v in pw.items()}  # auto-normalize
+    if total_w > 0:
+        pw = {k: v / total_w for k, v in pw.items()}
 
-    # Step 1: Min-Max scale
-    scaler_mm = MinMaxScaler()
-    scaled_vals = scaler_mm.fit_transform(df_in[ALL_RLI_FEATURES])
-    df_sc = pd.DataFrame(scaled_vals, columns=ALL_RLI_FEATURES, index=df_in.index)
+    # Step 1: Log-scale then MinMax 0–1
+    available = [f for f in ALL_RLI_FEATURES if f in df_in.columns]
+    df_log = np.log1p(df_in[available])
+    scaler = MinMaxScaler()
+    df_sc = pd.DataFrame(
+        scaler.fit_transform(df_log),
+        columns=available,
+        index=df_in.index,
+    )
 
-    # Step 2: Weighted pillar scores (vectorized)
+    # Step 2: Weighted pillar scores
     pillar_scores = {}
     for pname, pinfo in PILLARS.items():
-        feats = pinfo['features']
-        w = pw[pname]
+        feats = [f for f in pinfo['features'] if f in df_sc.columns]
+        w = pw.get(pname, 0)
         pillar_scores[pname] = df_sc[feats].mean(axis=1) * w
 
     pillar_df = pd.DataFrame(pillar_scores, index=df_in.index)
-    weighted_sum = pillar_df.sum(axis=1)  # Σ w_j * x̂_ij
+    weighted_sum = pillar_df.sum(axis=1)
 
     # Step 3: Shannon Entropy across 4 pillars
     pillar_props = pillar_df.div(pillar_df.sum(axis=1) + EPSILON, axis=0)
     H = -(pillar_props * np.log(pillar_props + EPSILON)).sum(axis=1)
 
-    # Step 4: Diversity multiplier [1 + H/H_max]
+    # Step 4: Diversity multiplier [1 + H / H_max]
     diversity_mult = 1 + (H / H_MAX)
 
     # Step 5: RLI = weighted_sum × diversity_multiplier
     raw_rli = weighted_sum * diversity_mult
 
-    # Step 6: Final Normalization (0–100 min-max)
+    # Step 6: Normalize 0–100
     r_min, r_max = raw_rli.min(), raw_rli.max()
-    rli_100 = ((raw_rli - r_min) / (r_max - r_min)) * 100
+    rli_100 = ((raw_rli - r_min) / (r_max - r_min + EPSILON)) * 100
 
     # Assemble result
     result = df_in.copy()
     for pname in PILLARS:
         result[f'pillar_{pname}'] = pillar_scores[pname].values
-    result['H_entropy'] = H.values
+    result['H_entropy']      = H.values
     result['diversity_mult'] = diversity_mult.values
-    result['raw_rli'] = raw_rli.values
-    result['RLI'] = rli_100.round(2).values
-    result['rank'] = result['RLI'].rank(ascending=False, method='min').astype(int)
+    result['raw_rli']        = raw_rli.values
+    result['RLI']            = rli_100.round(2).values
+    result['rank']           = result['RLI'].rank(ascending=False, method='min').astype(int)
 
-    return result.sort_values('rank'), scaler_mm
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Recommendation (notebook cell 32)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def recommend(df_imputed: pd.DataFrame, user_weights: dict | None = None, top_n: int = 10):
-    """Re-score with custom pillar weights, return top_n with match_pct."""
-    scored, _ = compute_rli(df_imputed, pillar_weights=user_weights)
-    scored['match_pct'] = (scored['RLI'] / scored['RLI'].max() * 100).round(1)
-    return scored.sort_values('RLI', ascending=False).head(top_n)
+    return result.sort_values('rank'), scaler
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Full Pipeline
-# ══════════════════════════════════════════════════════════════════════════════
+def build_global_ranking(df_raw: pd.DataFrame, pillar_weights: dict | None = None):
+    """
+    Aggregate all 348K properties → 176 neighborhoods, density-normalize,
+    compute RLI, cluster (K-Means), and attach PCA coordinates.
 
-def run_full_pipeline(csv_path: str):
-    """End-to-end: load → aggregate → cluster → impute → score."""
-    df_raw = pd.read_csv(csv_path)
-    df = aggregate_to_neighborhoods(df_raw)
+    Returns
+    -------
+    dict with keys:
+        'df_raw'     — original DataFrame (with category_name added)
+        'df_global'  — aggregated neighborhood matrix
+        'df_ranked'  — ranked DataFrame (index = neighborhood)
+        'pca_2d'     — fitted PCA object
+        'kmeans'     — fitted KMeans object
+    """
+    # Add category_name if missing
+    if 'category_name' not in df_raw.columns:
+        df_raw = df_raw.copy()
+        df_raw['category_name'] = df_raw['category'].map(CATEGORY_MAP)
 
-    labels, km, scaler_std, pca_2d, X_2d = fit_clusters(df)
-    df['km_cluster'] = labels
-    df['PC1'] = X_2d[:, 0]
-    df['PC2'] = X_2d[:, 1]
+    # ── 1. City-wide aggregation ──
+    df_global = df_raw.groupby('neighborhood').agg(
+        neighborhood_area_km2=('neighborhood_area_km2', 'first'),
+        property_count=('property_id', 'count'),
+        median_price=('price', 'median'),
+        median_area=('area', 'median'),
+        lat=('lat', 'mean'),
+        lng=('lng', 'mean'),
+        n_categories=('category', 'nunique'),
+        **{f: (f, 'mean') for f in ALL_RLI_FEATURES},
+    )
 
-    df_imputed = cluster_centroid_impute(df, labels)
+    # ── 2. Density normalization (raw counts ÷ km²) ──
+    for feat in COUNT_FEATURES:
+        if feat in df_global.columns:
+            df_global[feat] = df_global[feat] / df_global['neighborhood_area_km2']
+    df_global = df_global.replace([np.inf, -np.inf], 0).fillna(0)
 
-    df_scored, scaler_mm = compute_rli(df_imputed)
-    df_scored['km_cluster'] = df.loc[df_scored.index, 'km_cluster']
-    df_scored['PC1'] = df.loc[df_scored.index, 'PC1']
-    df_scored['PC2'] = df.loc[df_scored.index, 'PC2']
+    # ── 3. K-Means clustering ──
+    cluster_feats = [f for f in ALL_RLI_FEATURES if f in df_global.columns]
+    X_std = (df_global[cluster_feats] - df_global[cluster_feats].mean()) / (df_global[cluster_feats].std() + EPSILON)
+    kmeans = KMeans(n_clusters=K_BEST, random_state=42, n_init=10)
+    df_global['km_cluster'] = kmeans.fit_predict(X_std)
+
+    # ── 4. PCA for visualization ──
+    pca = PCA(n_components=2, random_state=42)
+    coords = pca.fit_transform(X_std)
+    df_global['PC1'] = coords[:, 0]
+    df_global['PC2'] = coords[:, 1]
+
+    # ── 5. Compute RLI ──
+    df_ranked, scaler = compute_rli(df_global, pillar_weights)
 
     return {
-        'df_raw': df_raw,
-        'df_neighborhoods': df,
-        'df_imputed': df_imputed,
-        'df_scored': df_scored,
-        'km_model': km,
-        'pca_2d': pca_2d,
-        'scaler_std': scaler_std,
-        'scaler_mm': scaler_mm,
-        'X_2d': X_2d,
-        'labels': labels,
+        'df_raw':    df_raw,
+        'df_global': df_global,
+        'df_ranked': df_ranked,
+        'pca_2d':    pca,
+        'kmeans':    kmeans,
+        'scaler':    scaler,
     }
+
+
+def recommend(df_ranked: pd.DataFrame, user_weights: dict | None = None, top_n: int = 20):
+    """
+    Re-score all neighborhoods with custom pillar weights.
+    Returns re-ranked DataFrame with match_pct (% of top scorer).
+    """
+    df_re, _ = compute_rli(df_ranked, pillar_weights=user_weights)
+
+    top_rli = df_re['RLI'].max()
+    df_re['match_pct'] = (df_re['RLI'] / (top_rli + EPSILON) * 100).round(1)
+
+    return df_re.head(top_n) if top_n else df_re
+
+
+def property_search(
+    df_raw: pd.DataFrame,
+    df_ranked: pd.DataFrame,
+    category: int,
+    min_price: float = 0,
+    max_price: float = float('inf'),
+    min_rooms: int = 0,
+    pillar_weights: dict | None = None,
+    price_weight: float = 0.20,
+):
+    """
+    Filter-first property search.
+
+    1. Filter raw properties by category + price + rooms.
+    2. Identify qualifying neighborhoods.
+    3. Re-score only those neighborhoods using RLI + price compatibility.
+
+    Returns
+    -------
+    dict with keys:
+        'results'              — DataFrame of ranked neighborhoods
+        'properties_matched'   — int, how many raw properties survived
+        'category_label'       — str
+    """
+    cat_label = CATEGORY_MAP.get(category, f'Category {category}')
+
+    # Ensure category_name exists
+    if 'category_name' not in df_raw.columns:
+        df_raw = df_raw.copy()
+        df_raw['category_name'] = df_raw['category'].map(CATEGORY_MAP)
+
+    # ── Step A: Strict filtering ──
+    mask = df_raw['category'] == category
+    mask &= df_raw['price'].between(min_price, max_price)
+
+    if cat_label not in NO_ROOM_CATEGORIES and min_rooms > 0:
+        mask &= df_raw['total_rooms'] >= min_rooms
+
+    filtered = df_raw[mask]
+
+    if len(filtered) == 0:
+        return {
+            'results': pd.DataFrame(),
+            'properties_matched': 0,
+            'category_label': cat_label,
+        }
+
+    # ── Step B: Neighborhood aggregation ──
+    neigh_stats = filtered.groupby('neighborhood').agg(
+        filtered_count=('property_id', 'count'),
+        avg_price=('price', 'mean'),
+        median_price=('price', 'median'),
+        avg_area=('area', 'mean'),
+        avg_rooms=('total_rooms', 'mean'),
+    ).round(1)
+
+    qualifying = neigh_stats.index.tolist()
+    df_score_input = df_ranked.loc[df_ranked.index.isin(qualifying)].copy()
+
+    # ── Step C: Re-score with user weights ──
+    df_scored, _ = compute_rli(df_score_input, pillar_weights=pillar_weights)
+
+    # ── Step D: Price compatibility score ──
+    budget_mid = (min_price + max_price) / 2
+    price_dist = np.abs(neigh_stats['avg_price'] - budget_mid)
+    price_max_dist = price_dist.max()
+    neigh_stats['price_score'] = (
+        (1 - price_dist / price_max_dist) * 100 if price_max_dist > 0 else 100.0
+    )
+
+    # ── Step E: Merge & combined score ──
+    overlap = neigh_stats.columns.intersection(df_scored.columns)
+    df_result = df_scored.join(neigh_stats.drop(columns=overlap), how='inner')
+
+    rli_w = 1 - price_weight
+    df_result['combined_score'] = (
+        df_result['RLI'] * rli_w + df_result['price_score'] * price_weight
+    ).round(2)
+
+    top_cs = df_result['combined_score'].max()
+    df_result['match_pct'] = (
+        (df_result['combined_score'] / (top_cs + EPSILON) * 100).round(1)
+    )
+    df_result['rank'] = df_result['combined_score'].rank(
+        ascending=False, method='min'
+    ).astype(int)
+    df_result = df_result.sort_values('rank')
+
+    return {
+        'results': df_result,
+        'properties_matched': len(filtered),
+        'category_label': cat_label,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONVENIENCE: Full Pipeline (used by API on startup)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_full_pipeline(csv_path: str):
+    """
+    Load CSV → build global ranking → return pipeline dict.
+    Keys: df_raw, df_global, df_ranked (=df_imputed=df_scored), pca_2d, kmeans, scaler.
+    """
+    df_raw = pd.read_csv(csv_path)
+    pipe = build_global_ranking(df_raw)
+
+    # Alias for backward compatibility with api.py
+    pipe['df_scored']  = pipe['df_ranked']
+    pipe['df_imputed'] = pipe['df_ranked']
+
+    return pipe
