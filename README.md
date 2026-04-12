@@ -1,4 +1,4 @@
-# Neighborhood DNA — The 15-Minute City Index for Riyadh
+# Riyadh Livability Index
 
 An end-to-end machine learning system that scores **176 Riyadh neighborhoods** on livability by fusing four data layers — real estate, urban services, public transit, and internet connectivity — into a single **Riyadh Livability Index (RLI)**.
 
