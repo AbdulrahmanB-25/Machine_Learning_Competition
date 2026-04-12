@@ -239,13 +239,21 @@ def property_search(
     min_rooms: int = 0,
     pillar_weights: dict | None = None,
     price_weight: float = 0.20,
+    cluster_weight: float = 0.15,
 ):
     """
-    Filter-first property search.
+    Filter-first property search with K-Means cluster matching.
 
     1. Filter raw properties by category + price + rooms.
     2. Identify qualifying neighborhoods.
-    3. Re-score only those neighborhoods using RLI + price compatibility.
+    3. Re-score using RLI + price compatibility + K-Means cluster fit.
+
+    K-Means Integration
+    -------------------
+    After filtering, the system computes the average pillar profile of each
+    K-Means cluster among qualifying neighborhoods, then scores each cluster
+    against the user's pillar weights. Neighborhoods in the best-fit cluster
+    receive a boost, making the recommendation cluster-aware.
 
     Returns
     -------
@@ -253,6 +261,8 @@ def property_search(
         'results'              — DataFrame of ranked neighborhoods
         'properties_matched'   — int, how many raw properties survived
         'category_label'       — str
+        'best_cluster'         — int, the cluster ID that best matches user priorities
+        'cluster_scores'       — dict, {cluster_id: alignment_score}
     """
     cat_label = CATEGORY_MAP.get(category, f'Category {category}')
 
@@ -275,6 +285,8 @@ def property_search(
             'results': pd.DataFrame(),
             'properties_matched': 0,
             'category_label': cat_label,
+            'best_cluster': -1,
+            'cluster_scores': {},
         }
 
     # ── Step B: Neighborhood aggregation ──
@@ -292,7 +304,47 @@ def property_search(
     # ── Step C: Re-score with user weights ──
     df_scored, _ = compute_rli(df_score_input, pillar_weights=pillar_weights)
 
-    # ── Step D: Price compatibility score ──
+    # ── Step D: K-Means cluster matching ──
+    # Score each cluster by how well its average pillar profile aligns with user weights
+    pw = pillar_weights if pillar_weights else {p: v['weight'] for p, v in PILLARS.items()}
+    total_w = sum(pw.values())
+    if total_w > 0:
+        pw = {k: v / total_w for k, v in pw.items()}
+
+    cluster_scores = {}
+    if 'km_cluster' in df_scored.columns:
+        pillar_cols = [f'pillar_{p}' for p in PILLARS.keys()]
+        available_pcols = [c for c in pillar_cols if c in df_scored.columns]
+
+        for cid, grp in df_scored.groupby('km_cluster'):
+            # Average pillar profile of this cluster
+            cluster_profile = grp[available_pcols].mean()
+            # Dot product with user weights = alignment score
+            alignment = sum(
+                cluster_profile.get(f'pillar_{p}', 0) * pw.get(p, 0)
+                for p in PILLARS.keys()
+            )
+            cluster_scores[int(cid)] = round(alignment, 6)
+
+        # Best cluster = highest alignment with user priorities
+        best_cluster = max(cluster_scores, key=cluster_scores.get) if cluster_scores else -1
+
+        # Normalize cluster scores to 0–100 for the boost
+        cs_vals = list(cluster_scores.values())
+        cs_min, cs_max = min(cs_vals), max(cs_vals)
+        cs_range = cs_max - cs_min
+
+        if cs_range > 0:
+            df_scored['cluster_fit'] = df_scored['km_cluster'].map(
+                lambda c: ((cluster_scores.get(c, 0) - cs_min) / cs_range) * 100
+            )
+        else:
+            df_scored['cluster_fit'] = 100.0
+    else:
+        best_cluster = -1
+        df_scored['cluster_fit'] = 0.0
+
+    # ── Step E: Price compatibility score ──
     budget_mid = (min_price + max_price) / 2
     price_dist = np.abs(neigh_stats['avg_price'] - budget_mid)
     price_max_dist = price_dist.max()
@@ -300,13 +352,17 @@ def property_search(
         (1 - price_dist / price_max_dist) * 100 if price_max_dist > 0 else 100.0
     )
 
-    # ── Step E: Merge & combined score ──
+    # ── Step F: Merge & combined score (RLI + Price + Cluster Fit) ──
     overlap = neigh_stats.columns.intersection(df_scored.columns)
     df_result = df_scored.join(neigh_stats.drop(columns=overlap), how='inner')
 
-    rli_w = 1 - price_weight
+    # Three-factor combined score
+    rli_w = 1 - price_weight - cluster_weight
+    rli_w = max(rli_w, 0)  # safety clamp
     df_result['combined_score'] = (
-        df_result['RLI'] * rli_w + df_result['price_score'] * price_weight
+        df_result['RLI'] * rli_w
+        + df_result['price_score'] * price_weight
+        + df_result['cluster_fit'] * cluster_weight
     ).round(2)
 
     top_cs = df_result['combined_score'].max()
@@ -322,6 +378,8 @@ def property_search(
         'results': df_result,
         'properties_matched': len(filtered),
         'category_label': cat_label,
+        'best_cluster': best_cluster,
+        'cluster_scores': cluster_scores,
     }
 
 

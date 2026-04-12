@@ -578,6 +578,15 @@ with tab2:
         help="0 means livability matters more. 1 means price fit matters more.",
     )
 
+    cluster_w = st.slider(
+        "Cluster Matching Weight",
+        0.0,
+        0.50,
+        0.15,
+        0.05,
+        help="How much K-Means neighborhood archetype matching influences the recommendation.",
+    )
+
     result = property_search(
         df_raw=pipe["df_raw"],
         df_ranked=df_ranked,
@@ -587,6 +596,7 @@ with tab2:
         min_rooms=min_r,
         pillar_weights=user_weights,
         price_weight=price_w,
+        cluster_weight=cluster_w,
     )
 
     df_res = result["results"]
@@ -597,17 +607,33 @@ with tab2:
             "No neighborhoods found with these filters. Try a higher budget, fewer rooms, or another category."
         )
     else:
+        best_cluster = result.get("best_cluster", -1)
+        cluster_scores = result.get("cluster_scores", {})
+
         st.success(
             f"{props_matched:,} properties matched. {len(df_res)} neighborhoods qualify."
         )
+
+        # ── Cluster matching info ──
+        if best_cluster >= 0 and cluster_scores:
+            cluster_info_cols = st.columns([2, 3])
+            with cluster_info_cols[0]:
+                st.metric(
+                    label="Best-Fit Cluster",
+                    value=f"Cluster {best_cluster}",
+                    delta=f"Score {cluster_scores.get(best_cluster, 0):.4f}",
+                )
+            with cluster_info_cols[1]:
+                st.caption("K-Means matched your lifestyle priorities to the neighborhood archetype that best aligns with your pillar weights.")
 
         top3s = df_res.head(3)
         cols_s = st.columns(3)
 
         for i, (name, row) in enumerate(top3s.iterrows()):
             label = name if isinstance(name, str) else str(name)
+            cluster_tag = f" (C{int(row['km_cluster'])})" if 'km_cluster' in row and pd.notna(row.get('km_cluster')) else ""
             cols_s[i].metric(
-                label=f"#{int(row['rank'])} — {label}",
+                label=f"#{int(row['rank'])} — {label}{cluster_tag}",
                 value=f"Match {row['match_pct']:.0f}%",
                 delta=f"Avg {row.get('avg_price', 0):,.0f} SAR",
             )
@@ -666,6 +692,8 @@ with tab2:
             "combined_score",
             "RLI",
             "price_score",
+            "cluster_fit",
+            "km_cluster",
             "avg_price",
             "median_price",
             "filtered_count",
@@ -687,6 +715,8 @@ with tab2:
                     "combined_score": "{:.2f}",
                     "RLI": "{:.2f}",
                     "price_score": "{:.1f}",
+                    "cluster_fit": "{:.1f}",
+                    "km_cluster": "{:.0f}",
                     "avg_price": "{:,.0f}",
                     "median_price": "{:,.0f}",
                     "filtered_count": "{:,.0f}",
