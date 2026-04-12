@@ -1,6 +1,9 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
+import plotly.express as px
+import plotly.figure_factory as ff
 import os
 
 from rli_engine import (
@@ -9,6 +12,10 @@ from rli_engine import (
     property_search,
     CATEGORY_MAP,
     NO_ROOM_CATEGORIES,
+    TIER_LABELS,
+    run_clustering_comparison,
+    run_regression_comparison,
+    run_classification_comparison,
 )
 
 # =========================================================
@@ -428,7 +435,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab1, tab2 = st.tabs(["City Ranking", "Property Search"])
+tab1, tab2, tab3 = st.tabs(["City Ranking", "Property Search", "ML Models"])
 
 # =========================================================
 # SHARED CHART DATA
@@ -731,5 +738,187 @@ with tab2:
             use_container_width=True,
             height=520,
         )
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# =========================================================
+# TAB 3: ML MODELS
+# =========================================================
+with tab3:
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.subheader("ML Model Comparison & Evaluation")
+    st.markdown(
+        '<div class="small-note">Multiple algorithms compared per problem. The best model is highlighted and used in the system.</div>',
+        unsafe_allow_html=True,
+    )
+
+    from sklearn.metrics import precision_score, recall_score, f1_score
+    from sklearn.decomposition import PCA as PCA_viz
+
+    ml_tab1, ml_tab2, ml_tab3 = st.tabs([
+        "Clustering (Unsupervised)",
+        "Price Prediction (Regression)",
+        "Price Tier (Classification)",
+    ])
+
+    # ─────────────────────────────────────────────
+    # ML TAB 1: CLUSTERING
+    # ─────────────────────────────────────────────
+    with ml_tab1:
+        st.markdown("### Neighborhood Clustering — K-Means vs Hierarchical")
+        st.caption("Both algorithms tested at k=2, 3, 5. Evaluated on Silhouette, Calinski-Harabasz, and Davies-Bouldin.")
+
+        with st.spinner("Running clustering comparison..."):
+            clust_results, X_std_clust, best_clust = run_clustering_comparison(df_ranked)
+
+        clust_rows = []
+        for name, m in clust_results.items():
+            clust_rows.append({
+                'Model': name,
+                'Silhouette ↑': round(m['silhouette'], 4),
+                'Calinski-Harabasz ↑': round(m['calinski_harabasz'], 1),
+                'Davies-Bouldin ↓': round(m['davies_bouldin'], 4),
+            })
+        df_clust_metrics = pd.DataFrame(clust_rows)
+
+        st.metric("Best Model", best_clust, f"Silhouette = {clust_results[best_clust]['silhouette']:.4f}")
+
+        st.dataframe(
+            df_clust_metrics.style.highlight_max(subset=['Silhouette ↑', 'Calinski-Harabasz ↑'], color='#c8e6c9')
+            .highlight_min(subset=['Davies-Bouldin ↓'], color='#c8e6c9'),
+            use_container_width=True,
+        )
+
+        pca_2d_coords = PCA_viz(n_components=2, random_state=42).fit_transform(X_std_clust)
+        best_labels = clust_results[best_clust]['labels']
+
+        fig_pca = px.scatter(
+            x=pca_2d_coords[:, 0], y=pca_2d_coords[:, 1],
+            color=[f"Cluster {l}" for l in best_labels],
+            labels={'x': 'PC1', 'y': 'PC2', 'color': 'Cluster'},
+            title=f"PCA Scatter — {best_clust}",
+            hover_name=df_ranked.index.tolist(),
+        )
+        fig_pca.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(color="#10333a"))
+        st.plotly_chart(fig_pca, use_container_width=True)
+
+        sil_data = {name: m['silhouette'] for name, m in clust_results.items()}
+        fig_sil = go.Figure(go.Bar(
+            x=list(sil_data.keys()), y=list(sil_data.values()),
+            marker_color=['#66bb6a' if n == best_clust else '#4fc3f7' for n in sil_data.keys()],
+        ))
+        fig_sil.update_layout(title="Silhouette Score Comparison", yaxis_title="Silhouette Score",
+                              paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(color="#10333a"))
+        st.plotly_chart(fig_sil, use_container_width=True)
+
+    # ─────────────────────────────────────────────
+    # ML TAB 2: REGRESSION
+    # ─────────────────────────────────────────────
+    with ml_tab2:
+        st.markdown("### Property Price Prediction — Regression Models")
+        st.caption("Predicting property price from area, category, rooms, and neighborhood features.")
+
+        with st.spinner("Training regression models (sampling 30K rows)..."):
+            reg_results, best_reg, reg_features, reg_scaler = run_regression_comparison(pipe['df_raw'])
+
+        br = reg_results[best_reg]
+        st.metric("Best Model", best_reg, f"R² = {br['R2']:.4f}")
+
+        reg_rows = []
+        for name, m in reg_results.items():
+            reg_rows.append({
+                'Model': name, 'R² ↑': m['R2'],
+                'MAE (SAR) ↓': f"{m['MAE']:,.0f}", 'RMSE (SAR) ↓': f"{m['RMSE']:,.0f}",
+                'MAPE (%) ↓': f"{m['MAPE']:.1f}",
+            })
+        st.dataframe(pd.DataFrame(reg_rows), use_container_width=True)
+
+        r2_data = {name: m['R2'] for name, m in reg_results.items()}
+        fig_r2_bar = go.Figure(go.Bar(
+            x=list(r2_data.keys()), y=list(r2_data.values()),
+            marker_color=['#66bb6a' if n == best_reg else '#4fc3f7' for n in r2_data.keys()],
+        ))
+        fig_r2_bar.update_layout(title="R² Score Comparison", yaxis_title="R²", yaxis_range=[0,1],
+                                  paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(color="#10333a"))
+        st.plotly_chart(fig_r2_bar, use_container_width=True)
+
+        y_actual = br['y_test']
+        y_pred = br['predictions']
+        sample_idx = np.random.RandomState(42).choice(len(y_actual), min(2000, len(y_actual)), replace=False)
+        fig_scatter = go.Figure()
+        fig_scatter.add_trace(go.Scatter(
+            x=y_actual[sample_idx], y=y_pred[sample_idx],
+            mode='markers', marker=dict(size=4, opacity=0.4, color='#4fc3f7'), name='Predictions',
+        ))
+        max_val = max(y_actual.max(), y_pred.max())
+        fig_scatter.add_trace(go.Scatter(
+            x=[0, max_val], y=[0, max_val],
+            mode='lines', line=dict(color='#ff6b6b', dash='dash'), name='Perfect',
+        ))
+        fig_scatter.update_layout(title=f"Actual vs Predicted — {best_reg}",
+                                   xaxis_title="Actual Price (SAR)", yaxis_title="Predicted Price (SAR)",
+                                   paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(color="#10333a"))
+        st.plotly_chart(fig_scatter, use_container_width=True)
+
+        best_model = br['model']
+        if hasattr(best_model, 'feature_importances_'):
+            imp = best_model.feature_importances_
+            feat_imp = sorted(zip(reg_features, imp), key=lambda x: -x[1])[:10]
+            fig_imp = go.Figure(go.Bar(
+                x=[f[1] for f in feat_imp][::-1], y=[f[0] for f in feat_imp][::-1],
+                orientation='h', marker_color='#f0c05a',
+            ))
+            fig_imp.update_layout(title=f"Top 10 Feature Importances — {best_reg}", xaxis_title="Importance",
+                                   paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(color="#10333a"))
+            st.plotly_chart(fig_imp, use_container_width=True)
+
+    # ─────────────────────────────────────────────
+    # ML TAB 3: CLASSIFICATION
+    # ─────────────────────────────────────────────
+    with ml_tab3:
+        st.markdown("### Price Tier Classification — Budget / Mid / Premium / Luxury")
+        st.caption("Classifying properties into price quartiles using neighborhood + property features.")
+
+        with st.spinner("Training classification models (sampling 30K rows)..."):
+            cls_results, best_cls, cls_scaler = run_classification_comparison(pipe['df_raw'])
+
+        bc = cls_results[best_cls]
+        st.metric("Best Model", best_cls, f"F1 = {bc['F1']:.4f}")
+
+        cls_rows = []
+        for name, m in cls_results.items():
+            cls_rows.append({
+                'Model': name, 'Accuracy ↑': m['Accuracy'],
+                'Precision ↑': m['Precision'], 'Recall ↑': m['Recall'], 'F1 Score ↑': m['F1'],
+            })
+        st.dataframe(pd.DataFrame(cls_rows), use_container_width=True)
+
+        f1_data = {name: m['F1'] for name, m in cls_results.items()}
+        fig_f1 = go.Figure(go.Bar(
+            x=list(f1_data.keys()), y=list(f1_data.values()),
+            marker_color=['#66bb6a' if n == best_cls else '#4fc3f7' for n in f1_data.keys()],
+        ))
+        fig_f1.update_layout(title="F1 Score Comparison", yaxis_title="F1 Score", yaxis_range=[0,1],
+                              paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(color="#10333a"))
+        st.plotly_chart(fig_f1, use_container_width=True)
+
+        cm = bc['confusion_matrix']
+        fig_cm = px.imshow(
+            cm, text_auto=True, x=TIER_LABELS, y=TIER_LABELS,
+            labels=dict(x="Predicted", y="Actual", color="Count"),
+            title=f"Confusion Matrix — {best_cls}", color_continuous_scale="Blues",
+        )
+        fig_cm.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(color="#10333a"))
+        st.plotly_chart(fig_cm, use_container_width=True)
+
+        per_class_p = precision_score(bc['y_test'], bc['predictions'], average=None)
+        per_class_r = recall_score(bc['y_test'], bc['predictions'], average=None)
+        per_class_f = f1_score(bc['y_test'], bc['predictions'], average=None)
+        pc_rows = []
+        for i, tier in enumerate(TIER_LABELS):
+            pc_rows.append({'Tier': tier, 'Precision': round(per_class_p[i], 4),
+                            'Recall': round(per_class_r[i], 4), 'F1': round(per_class_f[i], 4)})
+        st.markdown(f"**Per-Class Metrics — {best_cls}**")
+        st.dataframe(pd.DataFrame(pc_rows), use_container_width=True)
 
     st.markdown("</div>", unsafe_allow_html=True)

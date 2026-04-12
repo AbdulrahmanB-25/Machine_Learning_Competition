@@ -400,3 +400,181 @@ def run_full_pipeline(csv_path: str):
     pipe['df_imputed'] = pipe['df_ranked']
 
     return pipe
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ML MODELS — Supervised & Unsupervised with metrics
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.metrics import (
+    silhouette_score, calinski_harabasz_score, davies_bouldin_score,
+    r2_score, mean_absolute_error, mean_squared_error,
+    accuracy_score, precision_score, recall_score, f1_score, confusion_matrix,
+)
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LinearRegression, Ridge, LogisticRegression
+from sklearn.ensemble import (
+    RandomForestRegressor, RandomForestClassifier,
+    GradientBoostingRegressor, GradientBoostingClassifier,
+)
+
+# Feature columns used by supervised models
+SUPERVISED_FEATURES = [
+    'area', 'category', 'total_rooms',
+    'dining_cafe', 'med_facilities', 'edu_primary', 'religious',
+    'essential_retail', 'parks_green', 'sports_play',
+    'bus_count', 'metro_count', 'Fiber_Available', 'connectivity_score',
+    'neighborhood_area_km2', 'fitness_care', 'gov_civil',
+    'malls_shopping', 'edu_higher', 'pedestrian',
+]
+
+TIER_LABELS = ['Budget', 'Mid', 'Premium', 'Luxury']
+
+
+def run_clustering_comparison(df_ranked: pd.DataFrame):
+    """
+    Compare K-Means (k=2,3,5) vs Hierarchical (k=2,3,5) on neighborhood features.
+    Returns dict of {model_name: {silhouette, calinski_harabasz, davies_bouldin, labels}}.
+    """
+    cluster_feats = [f for f in ALL_RLI_FEATURES if f in df_ranked.columns]
+    X = df_ranked[cluster_feats].fillna(0)
+    scaler = StandardScaler()
+    X_std = scaler.fit_transform(X)
+
+    results = {}
+    for k in [2, 3, 5]:
+        # K-Means
+        km = KMeans(n_clusters=k, random_state=42, n_init=10)
+        labels_km = km.fit_predict(X_std)
+        results[f'KMeans (k={k})'] = {
+            'silhouette': silhouette_score(X_std, labels_km),
+            'calinski_harabasz': calinski_harabasz_score(X_std, labels_km),
+            'davies_bouldin': davies_bouldin_score(X_std, labels_km),
+            'labels': labels_km,
+            'k': k,
+        }
+        # Hierarchical
+        hc = AgglomerativeClustering(n_clusters=k, linkage='ward')
+        labels_hc = hc.fit_predict(X_std)
+        results[f'Hierarchical (k={k})'] = {
+            'silhouette': silhouette_score(X_std, labels_hc),
+            'calinski_harabasz': calinski_harabasz_score(X_std, labels_hc),
+            'davies_bouldin': davies_bouldin_score(X_std, labels_hc),
+            'labels': labels_hc,
+            'k': k,
+        }
+
+    # Identify best by silhouette
+    best_name = max(results, key=lambda x: results[x]['silhouette'])
+    return results, X_std, best_name
+
+
+def run_regression_comparison(df_raw: pd.DataFrame, sample_size: int = 30000):
+    """
+    Compare Linear, Ridge, Random Forest, Gradient Boosting on price prediction.
+    Returns dict of {model_name: {R2, MAE, RMSE, MAPE, predictions, model}}.
+    """
+    df = df_raw.sample(min(sample_size, len(df_raw)), random_state=42).copy()
+    df = df.dropna(subset=SUPERVISED_FEATURES + ['price'])
+    q01, q99 = df['price'].quantile(0.01), df['price'].quantile(0.99)
+    df = df[(df['price'] >= q01) & (df['price'] <= q99)]
+
+    X = df[SUPERVISED_FEATURES]
+    y = df['price']
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    scaler = StandardScaler()
+    X_train_sc = scaler.fit_transform(X_train)
+    X_test_sc = scaler.transform(X_test)
+
+    models = [
+        ('Linear Regression', LinearRegression(), True),
+        ('Ridge Regression', Ridge(alpha=1.0), True),
+        ('Random Forest', RandomForestRegressor(
+            n_estimators=100, max_depth=18, min_samples_split=5,
+            min_samples_leaf=3, random_state=42, n_jobs=-1), False),
+        ('Gradient Boosting', GradientBoostingRegressor(
+            n_estimators=150, max_depth=5, learning_rate=0.1,
+            subsample=0.8, random_state=42), False),
+    ]
+
+    results = {}
+    for name, model, use_scaled in models:
+        if use_scaled:
+            model.fit(X_train_sc, y_train)
+            preds = model.predict(X_test_sc)
+        else:
+            model.fit(X_train, y_train)
+            preds = model.predict(X_test)
+
+        r2 = r2_score(y_test, preds)
+        mae = mean_absolute_error(y_test, preds)
+        rmse = np.sqrt(mean_squared_error(y_test, preds))
+        mape = np.mean(np.abs((y_test - preds) / (y_test + EPSILON))) * 100
+
+        results[name] = {
+            'R2': round(r2, 4), 'MAE': round(mae, 0),
+            'RMSE': round(rmse, 0), 'MAPE': round(mape, 1),
+            'y_test': y_test.values, 'predictions': preds,
+            'model': model,
+        }
+
+    best_name = max(results, key=lambda x: results[x]['R2'])
+    return results, best_name, SUPERVISED_FEATURES, scaler
+
+
+def run_classification_comparison(df_raw: pd.DataFrame, sample_size: int = 30000):
+    """
+    Compare Logistic Regression, Random Forest, Gradient Boosting on price tier prediction.
+    Returns dict of {model_name: {Accuracy, Precision, Recall, F1, confusion_matrix, model}}.
+    """
+    df = df_raw.sample(min(sample_size, len(df_raw)), random_state=42).copy()
+    df = df.dropna(subset=SUPERVISED_FEATURES + ['price'])
+    q01, q99 = df['price'].quantile(0.01), df['price'].quantile(0.99)
+    df = df[(df['price'] >= q01) & (df['price'] <= q99)]
+
+    df['price_tier'] = pd.qcut(df['price'], 4, labels=[0, 1, 2, 3])
+    X = df[SUPERVISED_FEATURES]
+    y = df['price_tier'].astype(int)
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y)
+
+    scaler = StandardScaler()
+    X_train_sc = scaler.fit_transform(X_train)
+    X_test_sc = scaler.transform(X_test)
+
+    models = [
+        ('Logistic Regression', LogisticRegression(
+            max_iter=1000, C=1.0, random_state=42), True),
+        ('Random Forest', RandomForestClassifier(
+            n_estimators=100, max_depth=18, min_samples_split=5,
+            min_samples_leaf=3, random_state=42, n_jobs=-1), False),
+        ('Gradient Boosting', GradientBoostingClassifier(
+            n_estimators=150, max_depth=5, learning_rate=0.1,
+            subsample=0.8, random_state=42), False),
+    ]
+
+    results = {}
+    for name, model, use_scaled in models:
+        if use_scaled:
+            model.fit(X_train_sc, y_train)
+            preds = model.predict(X_test_sc)
+        else:
+            model.fit(X_train, y_train)
+            preds = model.predict(X_test)
+
+        results[name] = {
+            'Accuracy': round(accuracy_score(y_test, preds), 4),
+            'Precision': round(precision_score(y_test, preds, average='weighted'), 4),
+            'Recall': round(recall_score(y_test, preds, average='weighted'), 4),
+            'F1': round(f1_score(y_test, preds, average='weighted'), 4),
+            'confusion_matrix': confusion_matrix(y_test, preds),
+            'y_test': y_test.values, 'predictions': preds,
+            'model': model,
+        }
+
+    best_name = max(results, key=lambda x: results[x]['F1'])
+    return results, best_name, scaler
