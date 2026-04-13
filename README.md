@@ -31,20 +31,6 @@ The system delivers five capabilities through a Streamlit dashboard:
 
 ---
 
-## ML Model Results
-
-| Problem | Algorithms Tested | Best Model | Key Metric |
-|---|---|---|---|
-| **Clustering** (Unsupervised) | K-Means (k=2,3,5), Hierarchical (k=2,3,5) | K-Means (k=2) | Silhouette = 0.1761 |
-| **Price Prediction** (Regression) | Linear, Ridge, Random Forest, Gradient Boosting | Random Forest | R² = 0.919 |
-| **Price Tier** (Classification) | Logistic Regression, Random Forest, Gradient Boosting | Gradient Boosting | F1 = 0.877 |
-
-The best clustering model is used in the Recommender to match users to their ideal neighborhood archetype. The recommendation combines three factors:
-
-**Combined Score = RLI × 65% + Price Score × 20% + Cluster Fit × 15%**
-
----
-
 ## The 15-Minute City Concept
 
 Can residents reach everything they need — healthcare, education, groceries, parks, transit — within 15 minutes? This project measures that for every Riyadh neighborhood by building a composite livability score from real data.
@@ -106,6 +92,85 @@ All layers spatially joined via two-pass strategy (point-in-polygon + nearest-ne
 
 ---
 
+## ML Model Results
+
+### Unsupervised — Neighborhood Clustering
+
+K-Means and Hierarchical clustering tested at k=2, 3, and 5 on 176 neighborhoods using 16 standardized livability features.
+
+| Model | Silhouette ↑ | Calinski-Harabasz ↑ | Davies-Bouldin ↓ |
+|---|---|---|---|
+| **K-Means (k=2)** | **0.1761** | **24.3** | 2.1091 |
+| K-Means (k=3) | 0.1753 | 23.5 | 2.1103 |
+| K-Means (k=5) | 0.1664 | 21.2 | **1.5823** |
+| Hierarchical (k=2) | 0.1317 | 17.3 | 2.2956 |
+| Hierarchical (k=3) | 0.1460 | 17.9 | 1.7413 |
+| Hierarchical (k=5) | 0.1331 | 18.7 | 1.8536 |
+
+**Winner: K-Means (k=2)** — highest Silhouette score. The best cluster is used in the Recommender to match users to their ideal neighborhood archetype.
+
+**Metric definitions:**
+- **Silhouette Score** (−1 to 1): How well-separated clusters are. Higher = more distinct groups.
+- **Calinski-Harabasz**: Ratio of between-cluster to within-cluster variance. Higher = tighter clusters.
+- **Davies-Bouldin**: Average similarity between clusters. Lower = clusters are more different from each other.
+
+---
+
+### Supervised — Property Price Prediction (Regression)
+
+Four algorithms trained on 30K sampled properties to predict price from 20 features (area, category, rooms, neighborhood services, transit, connectivity). Outliers trimmed at 1st/99th percentile.
+
+| Model | R² ↑ | MAE (SAR) ↓ | RMSE (SAR) ↓ | MAPE (%) ↓ |
+|---|---|---|---|---|
+| Linear Regression | 0.4905 | 720,134 | 975,932 | 884.3 |
+| Ridge Regression | 0.4905 | 720,134 | 975,931 | 884.3 |
+| **Random Forest** | **0.9190** | **210,313** | **389,045** | **56.7** |
+| Gradient Boosting | 0.9101 | 243,901 | 410,010 | 106.3 |
+
+**Winner: Random Forest (R² = 0.919)** — explains 92% of price variance. Area is the strongest predictor, followed by category type and neighborhood service density.
+
+**Metric definitions:**
+- **R²** (0 to 1): Proportion of variance explained by the model. 1.0 = perfect.
+- **MAE**: Mean Absolute Error — on average, predictions are off by this SAR amount.
+- **RMSE**: Root Mean Squared Error — penalizes large errors more heavily than MAE.
+- **MAPE**: Mean Absolute Percentage Error — average percentage the prediction is off.
+
+---
+
+### Supervised — Price Tier Classification
+
+Three classifiers trained to categorize properties into quartile-based tiers: Budget (bottom 25%), Mid (25–50%), Premium (50–75%), Luxury (top 25%).
+
+| Model | Accuracy ↑ | Precision ↑ | Recall ↑ | F1 ↑ |
+|---|---|---|---|---|
+| Logistic Regression | 0.6360 | 0.6311 | 0.6360 | 0.6321 |
+| Random Forest | 0.8708 | 0.8719 | 0.8708 | 0.8713 |
+| **Gradient Boosting** | **0.8774** | **0.8786** | **0.8774** | **0.8779** |
+
+**Winner: Gradient Boosting (F1 = 0.878)** — classifies 87.7% of properties into the correct price tier.
+
+**Metric definitions:**
+- **Accuracy**: Percentage of all properties classified into the correct tier.
+- **Precision**: When the model says "Luxury", how often is it actually Luxury?
+- **Recall**: Of all actual Luxury homes, how many did the model catch?
+- **F1 Score**: Harmonic mean of Precision and Recall. Balances both types of errors.
+
+---
+
+### Recommendation Engine — Three-Factor Scoring
+
+The recommendation system combines all three ML components into a single combined score:
+
+$$Score = RLI \times w_{rli} + PriceScore \times w_{price} + ClusterFit \times w_{cluster}$$
+
+| Factor | Default Weight | Source |
+|---|---|---|
+| **RLI** (Livability) | 65% | 4-pillar weighted + entropy boost |
+| **Price Score** (Budget fit) | 20% | Distance from budget midpoint |
+| **Cluster Fit** (Archetype match) | 15% | K-Means cluster alignment with user priorities |
+
+---
+
 ## Tech Stack
 
 - **Data Processing:** pandas, NumPy, GeoPandas
@@ -130,22 +195,3 @@ All notebooks follow a consistent template: dark theme, shared color palette, cl
 | `Merge_Master_Dataset` | Spatial join → master dataset | Riyadh_Master_Dataset.csv (348K × 29) |
 | `ML_Clustering_Master` | PCA + K-Means + Hierarchical | Clustered neighborhood profiles |
 | `RLI_Engine` | Scoring + search + ML comparison | Same code as rli_engine.py |
-
----
-
-## Property Categories
-
-| ID | Category | ID | Category |
-|---|---|---|---|
-| 1 | Apartment (Rent) | 13 | Room |
-| 2 | Land | 14 | Shop |
-| 3 | Villa | 15 | Warehouse |
-| 4 | Floor (Rent) | 16 | Commercial Building |
-| 5 | Duplex (Rent) | 17 | Tower |
-| 6 | Apartment (Sale) | 18 | Camp |
-| 7 | Commercial Land | 19 | Parking |
-| 8 | Office | 20 | Studio |
-| 9 | Building | 21 | Chalet |
-| 10 | Compound | 22 | Duplex (Sale) |
-| 11 | Farm | 23 | Rest House |
-| — | — | 24 | Palace |
